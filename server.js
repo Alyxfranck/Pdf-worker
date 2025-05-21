@@ -1,420 +1,239 @@
-const express = require('express');
-const puppeteer = require('puppeteer');
-const cors = require('cors');
-const fs = require('fs-extra');
-const path = require('path');
-const { decode } = require('html-entities');
+  // this is the 
+  const express = require('express');
+  const cors = require('cors');
+  const fs = require('fs-extra');
+  const path = require('path');
+  const { getTemplate } = require('./templates/templateFactory');
+  const { generateExercisesHTML, processExerciseImages } = require('./utils/exerciseUtils');
+  const BrowserPool = require('./utils/browserPool');
+  const RequestQueue = require('./utils/requestQueue');
+  const app = express();
+  const PORT = process.env.PORT || 3001;
 
-const app = express();
-const PORT = process.env.PORT || 3001;
+  // Initialize browser pool and request queue
+  const browserPool = new BrowserPool({
+    maxPoolSize: process.env.MAX_BROWSER_POOL_SIZE || 3,
+    maxPageLifetime: process.env.MAX_PAGE_LIFETIME || 100
+  });
 
-// Middleware
-app.use(cors());
-app.use(express.json({ limit: '10mb' }));
-app.use(express.static('public'));
+  const requestQueue = new RequestQueue({
+    concurrency: process.env.REQUEST_CONCURRENCY || 2
+  });
 
-// Process text similar to your current implementation
-function processText(text) {
-  if (!text) return '';
-  
-  // Step 1: Decode HTML entities
-  let processed = decode(text);
-  
-  // Step 2: Replace XML control codes with newlines
-  processed = processed.replace(/_x000D_/g, '\n');
-  
-  // Step 3: Convert <br/> to newlines
-  processed = processed.replace(/<br\s*\/?>/gi, '\n');
-  
-  // Step 4: Remove excessive newlines
-  processed = processed.replace(/\n{3,}/g, '\n\n');
-  
-  // Step 5: Trim whitespace
-  processed = processed.trim();
-  
-  return processed;
-}
-
-// PDF generation endpoint
-app.post('/generate-pdf', async (req, res) => {
-  try {
-    const pdfData = req.body;
+  // Configure request processor function
+  requestQueue.setProcessingFunction(async (data) => {
+    const { pdfData, res } = data;
+    let browser = null;
     
-    // Process all text fields for proper formatting
-    const processedPdfData = {
-      ...pdfData,
-      patientName: pdfData.patientName,
-      patientNotes: processText(pdfData.patientNotes),
-      exercises: pdfData.exercises.map((ex) => ({
-        ...ex,
-        description: processText(ex.description)
-      }))
+    try {
+      // Process the request (similar to your existing code)
+      const processedPdfData = {
+        ...pdfData,
+        patientName: pdfData.patientName || 'Patient',
+        patientNotes: pdfData.patientNotes,
+        exercises: pdfData.exercises?.map((ex) => ({
+          ...ex,
+          description: ex.description
+        })) || []
+      };
+      
+      if (!processedPdfData.exercises || !Array.isArray(processedPdfData.exercises) || processedPdfData.exercises.length === 0) {
+        return res.status(400).json({ error: 'No exercises provided' });
+      }
+
+      // Process images
+      const { imageBase64Map, placeholderBase64 } = processExerciseImages(processedPdfData.exercises);
+      
+      // Format date
+      const formattedDate = processedPdfData.date 
+        ? new Date(processedPdfData.date).toLocaleDateString('en-US', {
+            year: 'numeric', month: 'long', day: 'numeric'
+          }) 
+        : new Date().toLocaleDateString('en-US', {
+            year: 'numeric', month: 'long', day: 'numeric'
+          });
+
+      // Generate HTML content
+      const exercisesHTML = generateExercisesHTML(
+        'default', 
+        processedPdfData.exercises, 
+        imageBase64Map, 
+        placeholderBase64,
+        { 
+          includeCalendar: processedPdfData.includeCalendar,
+          calendarOptions: processedPdfData.calendarOptions 
+        }
+      );
+      
+      const templateName = processedPdfData.template || 'default';
+      const templateGenerator = getTemplate(templateName);
+      const htmlContent = templateGenerator.generateTemplate(
+        { 
+          patientName: processedPdfData.patientName,
+          therapistNotes: processedPdfData.patientNotes,
+          exercisesHTML: exercisesHTML
+        },
+        { includeCalendar: processedPdfData.includeCalendar }
+      );
+
+      // Get browser from pool
+      browser = await browserPool.getBrowser();
+      const page = await browser.newPage();
+      
+      try {
+        // Set content with timeout
+        await page.setContent(htmlContent, { 
+          timeout: 60000,  // 60 second timeout
+          waitUntil: ['networkidle0', 'load', 'domcontentloaded']
+        });
+        
+        // Configure viewport
+        await page.setViewport({ width: 1240, height: 1754 });
+
+        // Generate PDF
+        const pdf = await page.pdf({ 
+          format: 'A4',
+          printBackground: true,
+          preferCSSPageSize: true,
+        });
+        
+        // Close page (but keep browser)
+        await page.close();
+        
+        // Format filename
+        const sanitizedDate = formattedDate.replace(/\s/g, '_');
+        const sanitizedName = processedPdfData.patientName
+          ? processedPdfData.patientName.replace(/[^a-z0-9]/gi, '_').toLowerCase()
+          : 'patient';
+        const filename = `exercise_plan_${sanitizedName}_${sanitizedDate}.pdf`;
+        
+        // Send response
+        res.setHeader('Content-Type', 'application/pdf');
+        res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+        res.setHeader('Cache-Control', 'no-store, max-age=0');
+        res.send(pdf);
+        
+        return { success: true };
+      } finally {
+        if (page && !page.isClosed()) {
+          await page.close().catch(() => {});
+        }
+      }
+    } catch (error) {
+      console.error('PDF generation error:', error);
+      
+      // Structured logging for monitoring
+      console.error(JSON.stringify({
+        timestamp: new Date().toISOString(),
+        error: error.message,
+        stack: error.stack,
+        patient: pdfData.patientName,
+        reqId: pdfData.requestId || 'unknown'
+      }));
+      
+      // Only send error response if not already sent
+      if (!res.headersSent) {
+        const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+        res.status(500).json({ 
+          error: 'Failed to generate PDF', 
+          details: errorMessage,
+          timestamp: new Date().toISOString()
+        });
+      }
+      
+      return { success: false, error };
+    } finally {
+      // Always release browser back to pool
+      if (browser) {
+        await browserPool.releaseBrowser(browser).catch(() => {});
+      }
+    }
+  });
+
+  // Middleware
+  app.use(cors());
+  app.use(express.json({ limit: '10mb' }));
+  app.use(express.static('public'));
+
+  // Request tracking middleware
+  app.use((req, res, next) => {
+    const requestId = Date.now().toString(36) + Math.random().toString(36).substr(2, 5);
+    req.requestId = requestId;
+    
+    // Log requests
+    console.log(`[${requestId}] ${req.method} ${req.path}`);
+    
+    // Track response time
+    const start = Date.now();
+    res.on('finish', () => {
+      const duration = Date.now() - start;
+      console.log(`[${requestId}] ${res.statusCode} ${duration}ms`);
+    });
+    
+    next();
+  });
+
+  // Rate limiting
+  let requestCount = 0;
+  const RATE_LIMIT_WINDOW = 60000; // 1 minute
+  const RATE_LIMIT = 60; // 60 requests per minute
+  setInterval(() => { requestCount = 0; }, RATE_LIMIT_WINDOW);
+
+  // PDF generation endpoint
+  app.post('/generate-pdf', async (req, res) => {
+    // Rate limiting check
+    requestCount++;
+    if (requestCount > RATE_LIMIT) {
+      return res.status(429).json({ 
+        error: 'Too many requests',
+        retryAfter: 'Please try again later'
+      });
+    }
+
+    const pdfData = {
+      ...req.body,
+      requestId: req.requestId
     };
     
-    if (!processedPdfData.exercises || !Array.isArray(processedPdfData.exercises) || processedPdfData.exercises.length === 0) {
-      return res.status(400).json({ error: 'No exercises provided' });
-    }
+    // Queue the request - this returns a promise that resolves when processing is complete
+    await requestQueue.add({ pdfData, res });
+  });
 
-    // Pre-load images as base64 data from the provided URLs
-    const imageBase64Map = new Map();
+  // Health check endpoint
+  app.get('/health', (req, res) => {
+    res.status(200).json({ 
+      status: 'ok',
+      version: process.env.npm_package_version || '1.0.0',
+      queueLength: requestQueue.length,
+      activeRequests: requestQueue.active,
+      poolSize: browserPool.browsers.length
+    });
+  });
+
+  // Graceful shutdown
+  process.on('SIGTERM', shutdown);
+  process.on('SIGINT', shutdown);
+
+  async function shutdown() {
+    console.log('Shutting down gracefully...');
     
-    // Create a simple placeholder for failed images
-    const placeholderSvg = `
-      <svg width="200" height="200" xmlns="http://www.w3.org/2000/svg">
-        <rect width="200" height="200" fill="#f0f0f0"/>
-        <text x="100" y="100" font-family="Arial" font-size="14" fill="#888" text-anchor="middle">Image not available</text>
-      </svg>
-    `;
-    const placeholderBase64 = `data:image/svg+xml;base64,${Buffer.from(placeholderSvg).toString('base64')}`;
+    // Close browser pool
+    await browserPool.closeAll();
     
-    // Process images if they're included in the request
-    for (const exercise of processedPdfData.exercises) {
-      // If the client sends base64 images directly, use them
-      if (exercise.imageBase64) {
-        imageBase64Map.set(exercise.id, exercise.imageBase64);
-      } else {
-        // Otherwise, set the placeholder
-        imageBase64Map.set(exercise.id, placeholderBase64);
-      }
-    }
-
-    // Format date
-    const formattedDate = processedPdfData.date 
-      ? new Date(processedPdfData.date).toLocaleDateString('en-US', {
-          year: 'numeric', month: 'long', day: 'numeric'
-        }) 
-      : new Date().toLocaleDateString('en-US', {
-          year: 'numeric', month: 'long', day: 'numeric'
-        });
-
-    // Generate the HTML content with the same template from your original code
-    const htmlContent = `
-      <!DOCTYPE html>
-      <html lang="en">
-      <head>
-        <meta charset="UTF-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>Exercise Plan - ${processedPdfData.patientName || 'Patient'}</title>
-        <style>
-          /* Base Typography */
-          @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
-          
-          :root {
-            --font-color: #1d1d1f;
-            --highlight-color: #0071e3;
-            --light-gray: #f5f5f7;
-            --border-color: #d2d2d7;
-            --section-gap: 1.5cm;
-          }
-          
-          @page {
-            size: A4;
-            margin: 1.5cm;
-          }
-          
-          * {
-            box-sizing: border-box;
-          }
-          
-          body {
-            margin: 0;
-            padding: 0;
-            color: var(--font-color);
-            font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
-            font-size: 11pt;
-            line-height: 1.47;
-            letter-spacing: -0.022em;
-            -webkit-font-smoothing: antialiased;
-            -moz-osx-font-smoothing: grayscale;
-          }
-          
-          /* Element Styling */
-          h1, h2, h3, h4, p {
-            margin: 0;
-          }
-          
-          h1 {
-            font-size: 28pt;
-            font-weight: 600;
-            letter-spacing: -0.03em;
-          }
-          
-          h2 {
-            font-size: 18pt;
-            font-weight: 600;
-            letter-spacing: -0.03em;
-          }
-          
-          h3 {
-            font-size: 14pt;
-            font-weight: 500;
-            letter-spacing: -0.02em;
-          }
-          
-          hr {
-            border: 0;
-            height: 1px;
-            background-color: var(--border-color);
-            margin: 0.8cm 0;
-          }
-          
-          /* Layout Components */
-          .document-header {
-            padding-bottom: var(--section-gap);
-            border-bottom: 1px solid var(--border-color);
-            margin-bottom: var(--section-gap);
-          }
-          
-          .header-content {
-            display: flex;
-            justify-content: space-between;
-            align-items: flex-start;
-          }
-          
-          .brand {
-            display: flex;
-            align-items: center;
-            gap: 0.8cm;
-          }
-          
-          .logo {
-            width: 1.2cm;
-            height: 1.2cm;
-            background-color: var(--highlight-color);
-            border-radius: 50%;
-            box-shadow: 0 2px 8px rgba(0, 0, 0, 0.12);
-          }
-          
-          .title {
-            color: var(--highlight-color);
-          }
-          
-          .patient-info {
-            text-align: right;
-            color: #515154;
-          }
-          
-          .patient-name {
-            color: var(--font-color);
-            margin-bottom: 4pt;
-          }
-          
-          .notes-section {
-            background-color: var(--light-gray);
-            padding: 0.6cm;
-            border-radius: 8px;
-            margin-bottom: var(--section-gap);
-          }
-          
-          .notes-title {
-            color: #86868b;
-            margin-bottom: 8pt;
-          }
-          
-          .exercise-container {
-            margin-bottom: var(--section-gap);
-            page-break-inside: avoid;
-            break-inside: avoid;
-          }
-          
-          .exercise-header {
-            display: flex;
-            align-items: center;
-            margin-bottom: 0.5cm;
-          }
-          
-          .exercise-number {
-            font-size: 20pt;
-            font-weight: 600;
-            color: var(--highlight-color);
-            margin-right: 0.5cm;
-            min-width: 0.8cm;
-          }
-          
-          .exercise-content {
-            display: flex;
-            gap: 1cm;
-            min-height: 5cm;
-          }
-          
-          .exercise-image-container {
-            width: 5cm;
-            height: 5cm;
-            flex: 0 0 5cm;
-            border-radius: 8px;
-            overflow: hidden;
-            background-color: #f0f0f0;
-          }
-          
-          .exercise-image {
-            width: 100%;
-            height: 100%;
-            object-fit: cover;
-          }
-          
-          .exercise-description {
-            flex: 1;
-          }
-          
-          .exercise-description p {
-            white-space: pre-line;
-            margin: 0;
-            line-height: 1.5;
-            font-size: 10.5pt;
-          }
-          
-          .exercise-description ul {
-            margin: 0.3cm 0;
-            padding-left: 0.5cm;
-          }
-          
-          .exercise-description li {
-            margin-bottom: 0.2cm;
-          }
-          
-          .document-footer {
-            margin-top: var(--section-gap);
-            padding-top: 0.5cm;
-            border-top: 1px solid var(--border-color);
-            text-align: center;
-            font-size: 9pt;
-            color: #86868b;
-          }
-          
-          main::after {
-            content: "";
-            display: block;
-            height: 4cm;
-          }
-          
-          .page-header {
-            display: flex;
-            justify-content: space-between;
-            margin-bottom: 1cm;
-            font-size: 9pt;
-            color: #86868b;
-            border-bottom: 1px solid var(--border-color);
-            padding-bottom: 0.3cm;
-          }
-        </style>
-      </head>
-      <body>
-        <div class="document-header">
-          <div class="header-content">
-            <div class="brand">
-              <div class="logo"></div>
-              <h1 class="title">Exercise Plan</h1>
-            </div>
-            <div class="patient-info">
-              ${processedPdfData.patientName ? `<h2 class="patient-name">${processedPdfData.patientName}</h2>` : ''}
-              <div>${formattedDate}</div>
-            </div>
-          </div>
-        </div>
-        
-        ${processedPdfData.patientNotes ? `
-        <div class="notes-section">
-          <h3 class="notes-title">Notes</h3>
-          <p>${processedPdfData.patientNotes}</p>
-        </div>
-        ` : ''}
-
-        <main>
-          ${processedPdfData.exercises.map((exercise, index) => {
-            // Get the base64 image data or fallback to placeholder
-            const base64Image = imageBase64Map.get(exercise.id) || placeholderBase64;
-              
-            return `
-              <div class="exercise-container">
-                <div class="exercise-header">
-                  <div class="exercise-number">${index + 1}</div>
-                  <h2 class="exercise-title">${exercise.title}</h2>
-                </div>
-                <div class="exercise-content">
-                  <div class="exercise-image-container">
-                    <img 
-                      class="exercise-image" 
-                      src="${base64Image}" 
-                      alt="Visual demonstration of ${exercise.title}"
-                    />
-                  </div>
-                  <div class="exercise-description">
-                    <p>${exercise.description || 'No specific instructions provided.'}</p>
-                  </div>
-                </div>
-              </div>
-              ${index < processedPdfData.exercises.length - 1 ? '<hr>' : ''}
-            `;
-          }).join('')}
-        </main>
-        
-        <div class="document-footer">
-          <p>Generated on ${new Date().toLocaleDateString()} • Exercise Plan</p>
-        </div>
-      </body>
-      </html>
-    `;
-
-    // Launch browser
-    const browser = await puppeteer.launch({
-      executablePath: '/usr/bin/google-chrome-stable',
-      args: [
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
-        '--disable-dev-shm-usage'
-      ]
+    // Allow server to finish processing requests
+    server.close(() => {
+      console.log('Server closed');
+      process.exit(0);
     });
     
-    const page = await browser.newPage();
-    
-    // Set content
-    await page.setContent(htmlContent);
-    
-    // Configure viewport for better rendering
-    await page.setViewport({ width: 1240, height: 1754 }); // A4 size at 150dpi
-
-    // Generate PDF with proper settings
-    const pdf = await page.pdf({ 
-      format: 'A4',
-      printBackground: true,
-      preferCSSPageSize: true,
-      margin: {
-        top: '1.5cm',
-        right: '1.5cm',
-        bottom: '1.5cm',
-        left: '1.5cm'
-      }
-    });
-    
-    // Close browser to free resources
-    await browser.close();
-
-    // Format the filename for download
-    const sanitizedDate = formattedDate.replace(/\s/g, '_');
-    const sanitizedName = processedPdfData.patientName
-      ? processedPdfData.patientName.replace(/[^a-z0-9]/gi, '_').toLowerCase()
-      : 'patient';
-    const filename = `exercise_plan_${sanitizedName}_${sanitizedDate}.pdf`;
-
-    // Return the PDF with appropriate headers
-    res.setHeader('Content-Type', 'application/pdf');
-    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
-    res.setHeader('Cache-Control', 'no-store, max-age=0');
-    res.send(pdf);
-  } catch (error) {
-    console.error('PDF generation error:', error);
-    
-    // Provide meaningful error response
-    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
-    res.status(500).json({ 
-      error: 'Failed to generate PDF', 
-      details: errorMessage,
-      timestamp: new Date().toISOString()
-    });
+    // Force shutdown after timeout
+    setTimeout(() => {
+      console.error('Forced shutdown after timeout');
+      process.exit(1);
+    }, 30000);
   }
-});
 
-// Start the server
-app.listen(PORT, () => {
-  console.log(`PDF Generator service running on port ${PORT}`);
-});
+  // Start server
+  const server = app.listen(PORT, () => {
+    console.log(`PDF Generator service running at http://localhost:${PORT}`);
+  });

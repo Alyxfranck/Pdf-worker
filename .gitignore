@@ -28,3 +28,9 @@ logs
 .vscode/
 *.swp
 *.swo
+
+# Scripts
+*.sh
+*.bat
+
+# docker run -p 3001:3001 pdf-worker
